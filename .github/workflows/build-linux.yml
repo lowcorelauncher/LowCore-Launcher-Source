@@ -32,7 +32,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          pip install pyinstaller PyQt5 keyring
+          pip install pyinstaller PyQt5 keyring minecraft-launcher-lib requests
 
       - name: Build with PyInstaller
         run: |
@@ -43,6 +43,7 @@ jobs:
             --name LowCoreLauncher \
             --add-data "assets:assets" \
             --collect-submodules keyring.backends \
+            --hidden-import minecraft_launcher_lib \
             main.py
 
       - name: Upload Linux Build Artifact
