@@ -20,9 +20,10 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QRunnable, QThreadPool, pyqtSignal, QObject, QSize,
-    QPropertyAnimation, QEasingCurve, QRect, QPoint, QTimer, pyqtProperty, QEvent
+    QPropertyAnimation, QEasingCurve, QRect, QPoint, QTimer, pyqtProperty, QEvent,
+    QVariantAnimation, QRectF
 )
-from PyQt6.QtGui import QPixmap, QImage, QIcon, QKeyEvent, QAction, QTextCursor
+from PyQt6.QtGui import QPixmap, QImage, QIcon, QKeyEvent, QAction, QTextCursor, QPainter, QColor, QPen
 from PyQt6.QtNetwork import QNetworkProxy
 
 from core.config import ConfigManager
@@ -36,6 +37,7 @@ from core.modrinth_service import ModrinthService
 from core.avatar_service import AvatarService
 from core.java_manager import JavaManager
 from core.discord_rpc import DiscordRPCManager
+from core import importer as inst_importer
 
 
 if sys.platform == "win32":
@@ -110,6 +112,7 @@ TRANSLATIONS = {
         "proxy_notice": "This only applies to the launcher. Minecraft does not accept proxy settings.",
         "apply_proxy": "Apply Proxy Settings",
         "new_instance": "+ New Instance",
+        "import_instance": "⇪ Import",
         "add_offline": "+ Offline",
         "add_ms": "+ Microsoft",
         "remove": "Remove"
@@ -137,6 +140,7 @@ TRANSLATIONS = {
         "proxy_notice": "هذا ينطبق فقط على المشغل. ماينكرافت لا تدعم البروكسي.",
         "apply_proxy": "تطبيق إعدادات البروكسي",
         "new_instance": "+ نسخة جديدة",
+        "import_instance": "⇪ استيراد",
         "add_offline": "+ أوفلاين",
         "add_ms": "+ مايكروسوفت",
         "remove": "حذف"
@@ -164,6 +168,7 @@ TRANSLATIONS = {
         "proxy_notice": "Gilt nur für den Launcher. Minecraft unterstützt keine Proxys.",
         "apply_proxy": "Proxy anwenden",
         "new_instance": "+ Neue Instanz",
+        "import_instance": "⇪ Importieren",
         "add_offline": "+ Offline",
         "add_ms": "+ Microsoft",
         "remove": "Entfernen"
@@ -1319,6 +1324,883 @@ class DeviceAuthWorker(QRunnable):
             self.signals.error.emit(str(e))
 
 
+class ImportSignals(QObject):
+    scanned = pyqtSignal(list)
+    progress = pyqtSignal(int, int, str)      # done_bytes, total_bytes, instance name
+    item_done = pyqtSignal(str, str)          # instance name, "" or error text
+    finished = pyqtSignal(list)               # names that were imported
+    error = pyqtSignal(str)
+
+
+class ImportScanWorker(QRunnable):
+    def __init__(self, folder: str = None):
+        super().__init__()
+        self.folder = folder
+        self.signals = ImportSignals()
+
+    def run(self):
+        try:
+            if self.folder:
+                entries = inst_importer.scan_folder(self.folder, with_sizes=True)
+            else:
+                entries = inst_importer.scan_default(with_sizes=True)
+            self.signals.scanned.emit(entries)
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
+
+class ImportCopyWorker(QRunnable):
+    def __init__(self, entries: list, inst_mgr, include_worlds: bool):
+        super().__init__()
+        self.entries = entries
+        self.inst_mgr = inst_mgr
+        self.include_worlds = include_worlds
+        self.signals = ImportSignals()
+
+    def run(self):
+        done_names = []
+        taken = {i.get("name", "").lower() for i in self.inst_mgr.list_instances()}
+        for entry in self.entries:
+            name = entry.get("name", "Instance")
+            try:
+                result = inst_importer.import_entry(
+                    entry, self.inst_mgr, include_worlds=self.include_worlds,
+                    progress_cb=lambda d, t, n=name: self.signals.progress.emit(d, t, n),
+                    taken_names=taken
+                )
+                taken.add(result["name"].lower())
+                done_names.append(os.path.basename(result["folder"]) if result.get("folder") else result["name"])
+                msg = ""
+                if result.get("failed_files"):
+                    msg = f"{len(result['failed_files'])} file(s) could not be copied"
+                self.signals.item_done.emit(result["name"], msg)
+            except Exception as e:
+                self.signals.item_done.emit(name, f"Failed: {e}")
+        self.signals.finished.emit(done_names)
+
+
+def _hex_rgba(hex_color: str, alpha: float) -> str:
+    h = hex_color.lstrip("#")
+    if len(h) != 6:
+        return hex_color
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r}, {g}, {b}, {alpha})"
+
+
+def _lerp_color(c1, c2, t: float) -> QColor:
+    t = max(0.0, min(1.0, t))
+    a, b = QColor(c1), QColor(c2)
+    return QColor(
+        int(a.red() + (b.red() - a.red()) * t),
+        int(a.green() + (b.green() - a.green()) * t),
+        int(a.blue() + (b.blue() - a.blue()) * t),
+        int(a.alpha() + (b.alpha() - a.alpha()) * t),
+    )
+
+
+# loader -> (colour on dark themes, colour on light themes)
+_LOADER_COLORS = {
+    "fabric": ("#DBB69B", "#9A6B42"),
+    "quilt": ("#C69BDB", "#8442A8"),
+    "forge": ("#7FA8E0", "#2F5FA3"),
+    "neoforge": ("#F29A4B", "#B3601A"),
+    "vanilla": ("#8FD18B", "#2E7D32"),
+}
+
+
+class ToggleSwitch(QWidget):
+    """Animated on/off switch (the knob slides and the track fades to the accent colour)."""
+    toggled = pyqtSignal(bool)
+
+    def __init__(self, t: dict, checked: bool = True, parent=None):
+        super().__init__(parent)
+        self.t = t
+        self._on = checked
+        self._pos = 1.0 if checked else 0.0
+        self.setFixedSize(46, 26)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._anim = QPropertyAnimation(self, b"knob", self)
+        self._anim.setDuration(200)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def _get_knob(self) -> float:
+        return self._pos
+
+    def _set_knob(self, v: float):
+        self._pos = v
+        self.update()
+
+    knob = pyqtProperty(float, _get_knob, _set_knob)
+
+    def isChecked(self) -> bool:
+        return self._on
+
+    def setChecked(self, value: bool, animate: bool = True):
+        if value == self._on:
+            return
+        self._on = value
+        self._anim.stop()
+        if animate:
+            self._anim.setStartValue(self._pos)
+            self._anim.setEndValue(1.0 if value else 0.0)
+            self._anim.start()
+        else:
+            self._set_knob(1.0 if value else 0.0)
+        self.toggled.emit(value)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.isEnabled() and self.rect().contains(event.position().toPoint()):
+            self.setChecked(not self._on)
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            self.setChecked(not self._on)
+        else:
+            super().keyPressEvent(event)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        if not self.isEnabled():
+            p.setOpacity(0.5)
+        track = _lerp_color(self.t["pill_hover"], self.t["accent"], self._pos)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(track)
+        p.drawRoundedRect(QRectF(0, 0, 46, 26), 13, 13)
+        if self.hasFocus():
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QColor(self.t["text_sub"]))
+            p.drawRoundedRect(QRectF(0.5, 0.5, 45, 25), 12.5, 12.5)
+            p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#FFFFFF"))
+        p.drawEllipse(QRectF(3 + self._pos * 20, 3, 20, 20))
+        p.end()
+
+
+class _TickCircle(QWidget):
+    """Round selector that fills with the accent colour and draws a check mark."""
+
+    def __init__(self, t: dict, ok: bool, parent=None):
+        super().__init__(parent)
+        self.t = t
+        self.ok = ok
+        self.selv = 0.0      # 0..1 selection progress
+        self.scale = 1.0     # pop animation
+        self.hover = 0.0
+        self.setFixedSize(30, 30)
+
+    def paintEvent(self, event):
+        t = self.t
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        r = 11.0 * self.scale
+        cx = cy = 15.0
+        accent = QColor(t["accent"])
+        if self.ok:
+            border = _lerp_color(_lerp_color(t["text_sub"], t["text"], self.hover * 0.6), accent, self.selv)
+            pen = QPen(border, 2)
+        else:
+            pen = QPen(QColor(t["border"]), 2, Qt.PenStyle.DashLine)
+        p.setPen(pen)
+        fill = QColor(accent)
+        fill.setAlpha(int(255 * max(0.0, min(1.0, self.selv))))
+        p.setBrush(fill)
+        p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
+
+        if self.selv > 0.02:
+            col = QColor(t["accent_text"])
+            col.setAlpha(int(255 * max(0.0, min(1.0, self.selv))))
+            cp = QPen(col, 2.6)
+            cp.setCapStyle(Qt.PenCapStyle.RoundCap)
+            cp.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(cp)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            s = self.scale
+            p.drawLine(int(cx - 4.5 * s), int(cy + 0.5 * s), int(cx - 1.5 * s), int(cy + 3.5 * s))
+            p.drawLine(int(cx - 1.5 * s), int(cy + 3.5 * s), int(cx + 4.5 * s), int(cy - 3.0 * s))
+        p.end()
+
+
+class ImportCard(QFrame):
+    """One clickable row. Hover, selection and the check mark all animate."""
+    toggled = pyqtSignal()
+
+    def __init__(self, entry: dict, t: dict, parent=None):
+        super().__init__(parent)
+        self.entry = entry
+        self.t = t
+        mc = entry.get("mc_version")
+        self.importable = bool(mc) and inst_importer.looks_like_mc_version(mc)
+        self._checked = False
+        self._hover = 0.0
+        self._selv = 0.0
+
+        self.setObjectName("ImportCard")
+        if self.importable:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(14, 13, 18, 13)
+        lay.setSpacing(14)
+
+        self.tick = _TickCircle(t, self.importable)
+        lay.addWidget(self.tick, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        col = QVBoxLayout()
+        col.setSpacing(7)
+
+        name = QLabel(entry.get("name", "Instance"))
+        name.setObjectName("ImportName")
+        name.setToolTip(entry.get("game_dir", ""))
+        col.addWidget(name)
+
+        chips = QHBoxLayout()
+        chips.setSpacing(6)
+        chips.setContentsMargins(0, 0, 0, 0)
+
+        loader = entry.get("loader") or "Vanilla"
+        loader_key = loader.lower().replace("-", "")
+        dark_c, light_c = _LOADER_COLORS.get(loader_key, ("#9EA4B0", "#636975"))
+        loader_c = light_c if t.get("is_light") else dark_c
+
+        if self.importable:
+            chips.addWidget(self._chip(f"Minecraft {mc}", t["text_sub"]))
+        else:
+            chips.addWidget(self._chip("Version unknown", "#E5534B"))
+        chips.addWidget(self._chip(loader, loader_c))
+        if entry.get("loader_version"):
+            chips.addWidget(self._chip(str(entry["loader_version"]), t["text_sub"]))
+        if entry.get("guessed"):
+            chips.addWidget(self._chip("Guessed from mods", "#E0A93B"))
+        chips.addStretch(1)
+        col.addLayout(chips)
+
+        if not self.importable:
+            warn = QLabel("Can't import: the Minecraft version couldn't be detected.")
+            warn.setObjectName("ImportWarn")
+            col.addWidget(warn)
+        lay.addLayout(col, stretch=1)
+
+        size_txt = inst_importer.format_size(entry["size"]) if entry.get("size") else ""
+        self.size_lbl = QLabel(size_txt)
+        self.size_lbl.setObjectName("ImportSize")
+        lay.addWidget(self.size_lbl, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        if entry.get("note"):
+            self.setToolTip(entry["note"])
+
+        self.search_text = " ".join([
+            entry.get("name", ""), entry.get("source", ""), str(mc or ""), loader
+        ]).lower()
+
+        self._hover_anim = QVariantAnimation(self)
+        self._hover_anim.setDuration(150)
+        self._hover_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._hover_anim.valueChanged.connect(self._on_hover_value)
+
+        self._sel_anim = QVariantAnimation(self)
+        self._sel_anim.setDuration(240)
+        self._sel_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._sel_anim.valueChanged.connect(self._on_sel_value)
+
+        self._pop_anim = QVariantAnimation(self)
+        self._pop_anim.setDuration(320)
+        self._pop_anim.setStartValue(0.55)
+        self._pop_anim.setEndValue(1.0)
+        self._pop_anim.setEasingCurve(QEasingCurve.Type.OutBack)
+        self._pop_anim.valueChanged.connect(self._on_pop_value)
+
+    @staticmethod
+    def _chip(text: str, color: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            f"background: {_hex_rgba(color, 0.16)}; color: {color}; border-radius: 9px;"
+            "padding: 2px 10px; font-size: 11px; font-weight: 700;"
+        )
+        return lbl
+
+    # ---- animation plumbing
+    def _on_hover_value(self, v):
+        self._hover = float(v)
+        self.tick.hover = self._hover
+        self.tick.update()
+        self.update()
+
+    def _on_sel_value(self, v):
+        self._selv = float(v)
+        self.tick.selv = self._selv
+        self.tick.update()
+        self.update()
+
+    def _on_pop_value(self, v):
+        self.tick.scale = float(v)
+        self.tick.update()
+
+    @staticmethod
+    def _animate(anim: QVariantAnimation, start: float, end: float):
+        anim.stop()
+        anim.setStartValue(float(start))
+        anim.setEndValue(float(end))
+        anim.start()
+
+    def enterEvent(self, event):
+        if self.importable and self.isEnabled():
+            self._animate(self._hover_anim, self._hover, 1.0)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._animate(self._hover_anim, self._hover, 0.0)
+        super().leaveEvent(event)
+
+    # ---- state
+    def is_checked(self) -> bool:
+        return self._checked
+
+    def set_checked(self, value: bool, animate: bool = True):
+        if not self.importable:
+            value = False
+        if value == self._checked:
+            return
+        self._checked = value
+        if animate:
+            self._sel_anim.stop()
+            self._sel_anim.setStartValue(self._selv)
+            self._sel_anim.setEndValue(1.0 if value else 0.0)
+            self._sel_anim.start()
+            if value:
+                self._pop_anim.stop()
+                self._pop_anim.start()
+            else:
+                self.tick.scale = 1.0
+        else:
+            self._on_sel_value(1.0 if value else 0.0)
+
+    def mousePressEvent(self, event):
+        if self.importable and self.isEnabled() and event.button() == Qt.MouseButton.LeftButton:
+            self.set_checked(not self._checked)
+            self.toggled.emit()
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event):
+        t = self.t
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        if not self.isEnabled():
+            p.setOpacity(0.6)
+        base = t["card_bg"] if self.importable else t["input_bg"]
+        sel_bg = _lerp_color(t["card_bg"], t["accent"], 0.13)
+        bg = _lerp_color(_lerp_color(base, t["item_hover"], self._hover), sel_bg, self._selv)
+        border = _lerp_color(_lerp_color(t["border"], t["text_sub"], self._hover * 0.7), t["accent"], self._selv)
+        p.setPen(QPen(border, 1.2))
+        p.setBrush(bg)
+        p.drawRoundedRect(QRectF(0.6, 0.6, self.width() - 1.2, self.height() - 1.2), 12, 12)
+        p.end()
+
+
+class ImportInstancesDialog(QDialog):
+    """Finds instances from other launchers (Minecraft Launcher, SKLauncher, Prism, CurseForge,
+    Modrinth App, ATLauncher, GDLauncher...) and copies them into LowCore. Originals are never touched."""
+
+    def __init__(self, inst_mgr, theme_name: str = "Dark Mode", parent=None):
+        super().__init__(parent)
+        self.inst_mgr = inst_mgr
+        self.entries = []
+        self.cards = []
+        self.groups = []          # (header_widget, [cards])
+        self.imported_folders = []
+        self._errors = []
+        self._busy = False
+        self._closing = False
+        self._intro_done = False
+        self._anims = {}
+        self._intro_anims = []
+        self.t = ThemeManager.get_theme_data(theme_name)
+        t = self.t
+
+        self.setWindowTitle("Import Instances")
+        self.setMinimumSize(700, 580)
+        self.resize(780, 700)
+        self.setWindowOpacity(0.0)   # faded in by showEvent
+
+        if parent and hasattr(parent, "app_icon") and not parent.app_icon.isNull():
+            self.setWindowIcon(parent.app_icon)
+
+        self.setStyleSheet(f"""
+            {ThemeManager.get_style(theme_name)}
+            QDialog {{ background-color: {t['bg']}; }}
+            QLabel#ImportTitle {{ font-size: 22px; font-weight: 800; color: {t['text']}; background: transparent; }}
+            QLabel#ImportSubtitle {{ font-size: 13px; color: {t['text_sub']}; background: transparent; }}
+            QScrollArea#ImportScroll {{ background: transparent; border: none; }}
+            QWidget#ImportContent {{ background: transparent; }}
+            QFrame#ImportCard {{ background: transparent; border: none; }}
+            QFrame#ImportCard QLabel {{ background: transparent; }}
+            QLabel#ImportName {{ font-size: 15px; font-weight: 700; color: {t['text']}; }}
+            QLabel#ImportSize {{ font-size: 12px; font-weight: 600; color: {t['text_sub']}; }}
+            QLabel#ImportWarn {{ font-size: 11px; color: #E5534B; }}
+            QLabel#GroupName {{
+                font-size: 12px; font-weight: 800; letter-spacing: 1px;
+                color: {t['text_sub']}; background: transparent;
+            }}
+            QLabel#GroupCount {{
+                background-color: {t['pill_bg']}; color: {t['text_sub']};
+                border-radius: 9px; padding: 1px 9px; font-size: 11px; font-weight: 700;
+            }}
+            QPushButton#LinkBtn {{
+                background: transparent; border: none; color: {t['accent']};
+                font-size: 12px; font-weight: 700; padding: 4px 6px;
+            }}
+            QPushButton#LinkBtn:hover {{ color: {t['accent_hover']}; text-decoration: underline; }}
+            QPushButton#LinkBtn:disabled {{ color: {t['text_sub']}; }}
+            QLabel#ImportSummary {{ font-size: 13px; font-weight: 700; color: {t['text']}; background: transparent; }}
+            QLabel#ImportStatus {{ font-size: 12px; color: {t['text_sub']}; background: transparent; }}
+            QLabel#ImportEmpty {{
+                font-size: 14px; color: {t['text_sub']}; background: transparent; padding: 40px 20px;
+            }}
+            QLabel#OptTitle {{ font-size: 13px; font-weight: 700; color: {t['text']}; background: transparent; }}
+            QLabel#OptSub {{ font-size: 11px; color: {t['text_sub']}; background: transparent; }}
+            QFrame#OptionsBar {{
+                background-color: {t['card_bg']}; border: 1px solid {t['border']}; border-radius: 12px;
+            }}
+            QFrame#OptionsBar QLabel {{ background: transparent; }}
+        """)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 24, 28, 22)
+        root.setSpacing(14)
+
+        # ---- header
+        title = QLabel("Import Instances")
+        title.setObjectName("ImportTitle")
+        root.addWidget(title)
+        sub = QLabel("Bring your worlds, mods and settings over from another launcher. "
+                     "Your originals are copied, never changed or deleted.")
+        sub.setObjectName("ImportSubtitle")
+        sub.setWordWrap(True)
+        root.addWidget(sub)
+
+        # ---- toolbar
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search instances...")
+        self.search.setFixedHeight(38)
+        self.search.setClearButtonEnabled(True)
+        self.search.textChanged.connect(self._apply_filter)
+        bar.addWidget(self.search, stretch=1)
+
+        self.btn_rescan = AnimatedButton("Rescan")
+        self.btn_rescan.setObjectName("PillButton")
+        self.btn_rescan.setFixedHeight(38)
+        self.btn_rescan.setMinimumWidth(90)
+        self.btn_rescan.clicked.connect(lambda: self.start_scan())
+        bar.addWidget(self.btn_rescan)
+
+        self.btn_browse = AnimatedButton("Browse Folder...")
+        self.btn_browse.setObjectName("PillButton")
+        self.btn_browse.setFixedHeight(38)
+        self.btn_browse.setMinimumWidth(140)
+        self.btn_browse.setToolTip("Pick a launcher folder, an instances folder, or a single instance folder")
+        self.btn_browse.clicked.connect(self.browse_folder)
+        bar.addWidget(self.btn_browse)
+        root.addLayout(bar)
+
+        # ---- scan indicator
+        self.scan_bar = QProgressBar()
+        self.scan_bar.setRange(0, 0)
+        self.scan_bar.setTextVisible(False)
+        self.scan_bar.setFixedHeight(4)
+        self.scan_bar.setGraphicsEffect(QGraphicsOpacityEffect(self.scan_bar))
+        root.addWidget(self.scan_bar)
+
+        # ---- results
+        self.scroll = QScrollArea()
+        self.scroll.setObjectName("ImportScroll")
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.content = QWidget()
+        self.content.setObjectName("ImportContent")
+        self.content_lay = QVBoxLayout(self.content)
+        self.content_lay.setContentsMargins(0, 0, 6, 0)
+        self.content_lay.setSpacing(8)
+        self.content_lay.addStretch(1)
+        self.scroll.setWidget(self.content)
+        root.addWidget(self.scroll, stretch=1)
+
+        # ---- options bar (animated switch)
+        opts_frame = QFrame()
+        opts_frame.setObjectName("OptionsBar")
+        opts = QHBoxLayout(opts_frame)
+        opts.setContentsMargins(16, 10, 12, 10)
+        opts.setSpacing(12)
+
+        self.worlds_toggle = ToggleSwitch(t, True)
+        self.worlds_check = self.worlds_toggle   # same isChecked()/setEnabled() API as before
+        opts.addWidget(self.worlds_toggle, alignment=Qt.AlignmentFlag.AlignVCenter)
+
+        txt = QVBoxLayout()
+        txt.setSpacing(1)
+        self.opt_title = QLabel("Include worlds (saves)")
+        self.opt_title.setObjectName("OptTitle")
+        self.opt_title.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.opt_title.mousePressEvent = lambda e: self.worlds_toggle.setChecked(not self.worlds_toggle.isChecked()) if self.worlds_toggle.isEnabled() else None
+        self.opt_sub = QLabel("Copies your saves folder too. Turn off for a faster import.")
+        self.opt_sub.setObjectName("OptSub")
+        txt.addWidget(self.opt_title)
+        txt.addWidget(self.opt_sub)
+        opts.addLayout(txt, stretch=1)
+
+        self.link_all = QPushButton("Select all")
+        self.link_all.setObjectName("LinkBtn")
+        self.link_all.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.link_all.clicked.connect(lambda: self._set_all(True))
+        opts.addWidget(self.link_all)
+        self.link_none = QPushButton("Clear")
+        self.link_none.setObjectName("LinkBtn")
+        self.link_none.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.link_none.clicked.connect(lambda: self._set_all(False))
+        opts.addWidget(self.link_none)
+        root.addWidget(opts_frame)
+
+        # ---- copy progress + status
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(6)
+        self.progress.setGraphicsEffect(QGraphicsOpacityEffect(self.progress))
+        self.progress.hide()
+        root.addWidget(self.progress)
+
+        self.status_lbl = QLabel("")
+        self.status_lbl.setObjectName("ImportStatus")
+        self.status_lbl.setWordWrap(True)
+        self.status_lbl.setGraphicsEffect(QGraphicsOpacityEffect(self.status_lbl))
+        root.addWidget(self.status_lbl)
+
+        # ---- footer
+        foot = QHBoxLayout()
+        foot.setSpacing(10)
+        self.summary = QLabel("Nothing selected")
+        self.summary.setObjectName("ImportSummary")
+        self.summary.setGraphicsEffect(QGraphicsOpacityEffect(self.summary))
+        foot.addWidget(self.summary)
+        foot.addStretch(1)
+        self.btn_close = AnimatedButton("Close")
+        self.btn_close.setObjectName("PillButton")
+        self.btn_close.setFixedHeight(42)
+        self.btn_close.setMinimumWidth(100)
+        self.btn_close.clicked.connect(self.reject)
+        foot.addWidget(self.btn_close)
+        self.btn_import = AnimatedButton("Import")
+        self.btn_import.setObjectName("PlayButton")
+        self.btn_import.setFixedHeight(42)
+        self.btn_import.setMinimumWidth(170)
+        self.btn_import.setEnabled(False)
+        self.btn_import.clicked.connect(self.start_import)
+        foot.addWidget(self.btn_import)
+        root.addLayout(foot)
+
+        QTimer.singleShot(0, self.start_scan)
+
+    # ---------------------------------------------------------------- animation helpers
+
+    def _run(self, key, anim: QPropertyAnimation):
+        old = self._anims.get(key)
+        if old is not None:
+            try:
+                old.stop()
+            except RuntimeError:
+                pass
+        self._anims[key] = anim
+        anim.start()
+
+    def _fade(self, widget: QWidget, start: float, end: float, ms: int = 220, hide_at_end: bool = False):
+        eff = widget.graphicsEffect()
+        if eff is None:
+            eff = QGraphicsOpacityEffect(widget)
+            widget.setGraphicsEffect(eff)
+        if end > 0:
+            widget.show()
+        anim = QPropertyAnimation(eff, b"opacity", self)
+        anim.setDuration(ms)
+        anim.setStartValue(start)
+        anim.setEndValue(end)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        if hide_at_end:
+            anim.finished.connect(widget.hide)
+        self._run(("fade", id(widget)), anim)
+
+    def _fade_text(self, label: QLabel, text: str):
+        if label.text() == text:
+            return
+        label.setText(text)
+        self._fade(label, 0.15, 1.0, 240)
+
+    def _play_intro(self):
+        """Staggered fade-in of group headers and cards."""
+        widgets = []
+        for header, cards in self.groups:
+            widgets.append(header)
+            widgets.extend(cards)
+        self._intro_anims = []
+        for i, w in enumerate(widgets[:24]):
+            eff = QGraphicsOpacityEffect(w)
+            eff.setOpacity(0.0)
+            w.setGraphicsEffect(eff)
+            anim = QPropertyAnimation(eff, b"opacity", w)
+            anim.setDuration(320)
+            anim.setStartValue(0.0)
+            anim.setEndValue(1.0)
+            anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+            def finish(widget=w):
+                try:
+                    widget.setGraphicsEffect(None)
+                except RuntimeError:
+                    pass
+            anim.finished.connect(finish)
+            self._intro_anims.append(anim)
+
+            def start(a=anim):
+                try:
+                    a.start()
+                except RuntimeError:
+                    pass
+            QTimer.singleShot(70 * i, start)
+
+    # window open / close fades
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self._intro_done:
+            self._intro_done = True
+            a = QPropertyAnimation(self, b"windowOpacity", self)
+            a.setDuration(240)
+            a.setStartValue(0.0)
+            a.setEndValue(1.0)
+            a.setEasingCurve(QEasingCurve.Type.OutCubic)
+            self._open_anim = a
+            a.start()
+
+    def done(self, result):
+        if self._closing or not self.isVisible():
+            super().done(result)
+            return
+        self._closing = True
+        a = QPropertyAnimation(self, b"windowOpacity", self)
+        a.setDuration(170)
+        a.setStartValue(self.windowOpacity())
+        a.setEndValue(0.0)
+        a.setEasingCurve(QEasingCurve.Type.InCubic)
+        a.finished.connect(lambda: QDialog.done(self, result))
+        self._close_anim = a
+        a.start()
+
+    # ---------------------------------------------------------------- helpers
+
+    def _clear_results(self):
+        while self.content_lay.count():
+            item = self.content_lay.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+        self.cards = []
+        self.groups = []
+
+    def _set_busy(self, busy: bool):
+        self._busy = busy
+        for w in (self.btn_rescan, self.btn_browse, self.worlds_toggle, self.search,
+                  self.link_all, self.link_none, self.btn_close):
+            w.setEnabled(not busy)
+        for c in self.cards:
+            c.setEnabled(not busy)
+        self._refresh_summary()
+
+    # ---------------------------------------------------------------- scanning
+
+    def start_scan(self, folder: str = None):
+        if self._busy:
+            return
+        self._clear_results()
+        self.content_lay.addStretch(1)
+        self._fade_text(self.status_lbl, "Scanning for other launchers..." if not folder else f"Scanning {folder} ...")
+        self._fade(self.scan_bar, 0.0, 1.0, 200)
+        self._set_busy(True)
+        worker = ImportScanWorker(folder)
+        worker.signals.scanned.connect(self._on_scanned)
+        worker.signals.error.connect(self._on_scan_error)
+        QThreadPool.globalInstance().start(worker)
+
+    def browse_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select a launcher or instance folder")
+        if folder:
+            self.start_scan(folder)
+
+    def _on_scan_error(self, err: str):
+        self._fade(self.scan_bar, 1.0, 0.0, 200, hide_at_end=True)
+        self._set_busy(False)
+        self._fade_text(self.status_lbl, f"Scan failed: {err}")
+
+    def _on_scanned(self, entries: list):
+        self._fade(self.scan_bar, 1.0, 0.0, 200, hide_at_end=True)
+        self.entries = entries
+        self._clear_results()
+
+        if not entries:
+            empty = QLabel("No instances found automatically.\n\n"
+                           "Use \"Browse Folder...\" and pick the other launcher's folder.")
+            empty.setObjectName("ImportEmpty")
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            empty.setWordWrap(True)
+            self.content_lay.addStretch(1)
+            self.content_lay.addWidget(empty)
+            self.content_lay.addStretch(2)
+            self._fade(empty, 0.0, 1.0, 400)
+            self._fade_text(self.status_lbl, "")
+            self._set_busy(False)
+            return
+
+        by_source = {}
+        for e in entries:
+            by_source.setdefault(e.get("source", "Other"), []).append(e)
+
+        for source, items in by_source.items():
+            header = QWidget()
+            hl = QHBoxLayout(header)
+            hl.setContentsMargins(2, 8, 0, 0)
+            hl.setSpacing(8)
+            gname = QLabel(source.upper())
+            gname.setObjectName("GroupName")
+            gcount = QLabel(str(len(items)))
+            gcount.setObjectName("GroupCount")
+            hl.addWidget(gname)
+            hl.addWidget(gcount)
+            hl.addStretch(1)
+            group_cards = []
+            gsel = QPushButton("Select group")
+            gsel.setObjectName("LinkBtn")
+            gsel.setCursor(Qt.CursorShape.PointingHandCursor)
+            hl.addWidget(gsel)
+            self.content_lay.addWidget(header)
+
+            for e in items:
+                card = ImportCard(e, self.t)
+                card.toggled.connect(self._refresh_summary)
+                self.content_lay.addWidget(card)
+                group_cards.append(card)
+                self.cards.append(card)
+            gsel.clicked.connect(lambda _=False, cs=group_cards: self._select_cards(cs))
+            self.groups.append((header, group_cards))
+
+        self.content_lay.addStretch(1)
+        self._fade_text(self.status_lbl, f"Found {len(entries)} instance(s). Click the ones you want to import.")
+        self._apply_filter(self.search.text())
+        self._set_busy(False)
+        self._play_intro()
+
+    # ---------------------------------------------------------------- selection
+
+    def _checked_entries(self) -> list:
+        return [c.entry for c in self.cards if c.is_checked()]
+
+    def _select_cards(self, cards: list):
+        for c in cards:
+            if (not c.isHidden()) and c.importable:
+                c.set_checked(True)
+        self._refresh_summary()
+
+    def _set_all(self, checked: bool):
+        for c in self.cards:
+            if checked and c.isHidden():
+                continue
+            c.set_checked(checked)
+        self._refresh_summary()
+
+    def _apply_filter(self, text: str = ""):
+        q = (text or "").strip().lower()
+        for header, cards in self.groups:
+            any_visible = False
+            for c in cards:
+                show = (not q) or q in c.search_text
+                c.setVisible(show)
+                any_visible = any_visible or show
+            header.setVisible(any_visible)
+
+    def _refresh_summary(self, *_):
+        chosen = self._checked_entries()
+        n = len(chosen)
+        if n:
+            total = sum(int(e.get("size") or 0) for e in chosen)
+            size_txt = f" · {inst_importer.format_size(total)}" if total else ""
+            self._fade_text(self.summary, f"{n} selected{size_txt}")
+            self.btn_import.setText(f"Import {n} instance{'s' if n != 1 else ''}")
+        else:
+            self._fade_text(self.summary, "Nothing selected")
+            self.btn_import.setText("Import")
+        self.btn_import.setEnabled(n > 0 and not self._busy)
+
+    # ---------------------------------------------------------------- importing
+
+    def start_import(self):
+        chosen = self._checked_entries()
+        if not chosen or self._busy:
+            return
+        self._set_busy(True)
+        self.btn_import.setEnabled(False)
+        self.progress.setValue(0)
+        self._fade(self.progress, 0.0, 1.0, 220)
+        self._errors = []
+        self._fade_text(self.status_lbl, f"Importing {len(chosen)} instance(s)...")
+
+        worker = ImportCopyWorker(chosen, self.inst_mgr, self.worlds_toggle.isChecked())
+        worker.signals.progress.connect(self._on_progress)
+        worker.signals.item_done.connect(self._on_item_done)
+        worker.signals.finished.connect(self._on_finished)
+        QThreadPool.globalInstance().start(worker)
+
+    def _on_progress(self, done: int, total: int, name: str):
+        target = int(done * 100 / total) if total else 0
+        anim = QPropertyAnimation(self.progress, b"value", self)
+        anim.setDuration(180)
+        anim.setStartValue(self.progress.value())
+        anim.setEndValue(target)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._run("progress", anim)
+        self.status_lbl.setText(
+            f"Copying '{name}'...  {inst_importer.format_size(done)} / {inst_importer.format_size(total)}")
+
+    def _on_item_done(self, name: str, problem: str):
+        if problem:
+            self._errors.append(f"{name}: {problem}")
+
+    def _on_finished(self, folders: list):
+        self.imported_folders = folders
+        self.progress.setValue(100)
+        self._fade(self.progress, 1.0, 0.0, 300, hide_at_end=True)
+        self._set_busy(False)
+        if folders and not self._errors:
+            self._fade_text(self.status_lbl, f"Imported {len(folders)} instance(s).")
+            QTimer.singleShot(350, self.accept)
+            return
+        if folders:
+            self._fade_text(self.status_lbl, f"Imported {len(folders)} instance(s), with problems:\n"
+                            + "\n".join(self._errors[:6]))
+        else:
+            self._fade_text(self.status_lbl, "Nothing was imported:\n" + "\n".join(self._errors[:6]))
+
+    def reject(self):
+        if self._busy:
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self._busy:
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+
 class NewInstanceDialog(QDialog):
     def __init__(self, all_versions: list, theme_name: str = "Dark Mode", parent=None):
         super().__init__(parent)
@@ -1839,6 +2721,13 @@ class MainWindow(QMainWindow):
         self.btn_new_inst.setFixedHeight(40)
         self.btn_new_inst.clicked.connect(self.prompt_new_instance)
         inst_bar.addWidget(self.btn_new_inst, stretch=1)
+
+        self.btn_import_inst = AnimatedButton(I18n.t("import_instance"))
+        self.btn_import_inst.setObjectName("PillButton")
+        self.btn_import_inst.setFixedHeight(40)
+        self.btn_import_inst.setToolTip("Import instances from the Minecraft Launcher, SKLauncher, Prism, CurseForge, Modrinth App, ATLauncher...")
+        self.btn_import_inst.clicked.connect(self.prompt_import_instances)
+        inst_bar.addWidget(self.btn_import_inst, stretch=1)
         card_layout.addLayout(inst_bar)
 
         self.acc_title = QLabel("Account")
@@ -2627,6 +3516,7 @@ class MainWindow(QMainWindow):
         self.acc_title.setText(I18n.t("account"))
         self.ram_title.setText(I18n.t("ram_alloc"))
         self.btn_new_inst.setText(I18n.t("new_instance"))
+        self.btn_import_inst.setText(I18n.t("import_instance"))
         self.btn_offline.setText(I18n.t("add_offline"))
         self.btn_ms.setText(I18n.t("add_ms"))
 
@@ -3012,6 +3902,16 @@ class MainWindow(QMainWindow):
             self.config.set("active_instance", os.path.basename(new_inst["path"]))
             self.refresh_instances()
             self.status_lbl.setText(I18n.t("ready"))
+
+    def prompt_import_instances(self):
+        dlg = ImportInstancesDialog(self.inst_mgr, self.current_theme, self)
+        dlg.exec()
+        if dlg.imported_folders:
+            self.content_browser_user_overridden = False
+            self.config.set("active_instance", dlg.imported_folders[-1])
+            self.refresh_instances()
+            self.status_lbl.setText(I18n.t("ready"))
+            self.show_alert("Import complete", f"Imported {len(dlg.imported_folders)} instance(s). The last one is now selected.")
 
     def on_search_text_changed(self, text: str):
         self.search_debounce_timer.start()
